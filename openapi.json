@@ -1,0 +1,252 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Pappi Pizza Actions API (PRO)",
+    "version": "1.2.0",
+    "description": "API interna da Pappi Pizza para atendentes via GPT Actions. Públicos: /, /health, /meta, /debug-auth, /maps/quote, /maps/reverse. Protegidos por X-API-Key: /store, /catalog, /customers, /orders, /orders/{orderId}, /orders/{orderId}/status, /checkout/whatsapp."
+  },
+  "servers": [{ "url": "https://pappi-api.onrender.com" }],
+  "components": {
+    "securitySchemes": {
+      "AttendantApiKey": { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+    },
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "app": { "type": "string" },
+          "time": { "type": "string" }
+        }
+      },
+      "MetaResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "app": { "type": "string" },
+          "version": { "type": "string" },
+          "env": {
+            "type": "object",
+            "properties": {
+              "hasWhatsapp": { "type": "boolean" },
+              "hasCardapioWeb": { "type": "boolean" },
+              "hasGoogleMaps": { "type": "boolean" },
+              "hasStoreLatLng": { "type": "boolean" }
+            }
+          },
+          "store": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "city": { "type": "string" },
+              "state": { "type": "string" },
+              "menu_url": { "type": "string" },
+              "whatsapp_human": { "type": "string" }
+            }
+          },
+          "time": { "type": "string" }
+        }
+      },
+      "DebugAuthResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "hasAttendantKey": { "type": "boolean" },
+          "hasWhatsappToken": { "type": "boolean" },
+          "hasWhatsappPhoneNumberId": { "type": "boolean" },
+          "hasWebhookVerifyToken": { "type": "boolean" },
+          "cardapioWebBaseUrl": { "type": "string" },
+          "hasCardapioWebToken": { "type": "boolean" },
+          "hasCardapioWebStoreId": { "type": "boolean" },
+          "hasGoogleMapsKey": { "type": "boolean" },
+          "hasStoreLatLng": { "type": "boolean" },
+          "hasCardapioWebWebhookToken": { "type": "boolean" }
+        }
+      },
+      "StoreResponse": {
+        "type": "object",
+        "properties": {
+          "store_id": { "type": "string" },
+          "name": { "type": "string" },
+          "city": { "type": "string" },
+          "state": { "type": "string" },
+          "menu_url": { "type": "string" },
+          "store_location": {
+            "type": ["object", "null"],
+            "properties": { "lat": { "type": "number" }, "lng": { "type": "number" } }
+          }
+        }
+      },
+      "CustomerCreate": {
+        "type": "object",
+        "required": ["phone"],
+        "properties": { "name": { "type": "string" }, "phone": { "type": "string" } }
+      },
+      "CustomerCreateResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "customer": {
+            "type": "object",
+            "properties": {
+              "name": { "type": ["string", "null"] },
+              "phone": { "type": "string" }
+            }
+          }
+        }
+      },
+      "OrderCreate": {
+        "type": "object",
+        "properties": {
+          "order_id": { "type": "string" },
+          "channel": { "type": "string" },
+          "store_id": { "type": "string" },
+          "customer": {
+            "type": "object",
+            "required": ["phone"],
+            "properties": { "name": { "type": "string" }, "phone": { "type": "string" } }
+          },
+          "fulfillment": { "type": "object" },
+          "items": { "type": "array", "items": { "type": "object" } },
+          "pricing": { "type": "object" },
+          "payment": { "type": "object" },
+          "notes": { "type": ["string", "null"] },
+          "meta": { "type": "object" }
+        }
+      },
+      "OrderCreatedResponse": {
+        "type": "object",
+        "properties": {
+          "order_id": { "type": "string" },
+          "status": { "type": "string" },
+          "created_at": { "type": "string" },
+          "estimated_delivery_minutes": { "type": ["integer", "null"] },
+          "payment": { "type": "object" },
+          "pricing": { "type": "object" }
+        }
+      },
+      "OrderStatusPatch": {
+        "type": "object",
+        "required": ["status"],
+        "properties": { "status": { "type": "string" } }
+      },
+      "CheckoutRequest": {
+        "type": "object",
+        "required": ["phone"],
+        "properties": { "phone": { "type": "string" }, "text": { "type": "string" } }
+      },
+      "CheckoutResponse": {
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" }, "url": { "type": "string" } }
+      },
+      "MapsQuoteResponse": {
+        "type": "object",
+        "properties": {
+          "km": { "type": "number" },
+          "eta_minutes": { "type": "integer" },
+          "delivery_fee": { "type": ["number", "null"] },
+          "is_serviceable": { "type": "boolean" }
+        }
+      },
+      "MapsReverseResponse": {
+        "type": "object",
+        "properties": { "formatted_address": { "type": "string" } }
+      }
+    }
+  },
+  "security": [{ "AttendantApiKey": [] }],
+  "paths": {
+    "/": { "get": { "operationId": "root", "security": [], "responses": { "200": { "description": "OK" } } } },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "security": [],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } } }
+        }
+      }
+    },
+    "/meta": {
+      "get": {
+        "operationId": "getMeta",
+        "security": [],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MetaResponse" } } } }
+        }
+      }
+    },
+    "/debug-auth": {
+      "get": {
+        "operationId": "debugAuth",
+        "security": [],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DebugAuthResponse" } } } }
+        }
+      }
+    },
+    "/maps/quote": {
+      "get": {
+        "operationId": "mapsQuote",
+        "security": [],
+        "parameters": [{ "name": "address", "in": "query", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MapsQuoteResponse" } } } }
+        }
+      }
+    },
+    "/maps/reverse": {
+      "get": {
+        "operationId": "mapsReverse",
+        "security": [],
+        "parameters": [
+          { "name": "lat", "in": "query", "required": true, "schema": { "type": "number" } },
+          { "name": "lng", "in": "query", "required": true, "schema": { "type": "number" } }
+        ],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MapsReverseResponse" } } } }
+        }
+      }
+    },
+    "/store": { "get": { "operationId": "getStore", "responses": { "200": { "description": "OK" }, "401": { "description": "Unauthorized" } } } },
+    "/catalog": { "get": { "operationId": "getCatalog", "responses": { "200": { "description": "OK" }, "401": { "description": "Unauthorized" } } } },
+    "/customers": {
+      "post": {
+        "operationId": "createCustomer",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CustomerCreate" } } } },
+        "responses": { "200": { "description": "OK" }, "400": { "description": "BadRequest" }, "401": { "description": "Unauthorized" } }
+      }
+    },
+    "/orders": {
+      "post": {
+        "operationId": "createOrder",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderCreate" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderCreatedResponse" } } } } }
+      }
+    },
+    "/orders/{orderId}": {
+      "get": {
+        "operationId": "getOrderById",
+        "parameters": [{ "name": "orderId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "OK" }, "401": { "description": "Unauthorized" }, "404": { "description": "NotFound" } }
+      }
+    },
+    "/orders/{orderId}/status": {
+      "patch": {
+        "operationId": "patchOrderStatus",
+        "parameters": [{ "name": "orderId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderStatusPatch" } } } },
+        "responses": { "200": { "description": "OK" }, "400": { "description": "BadRequest" }, "401": { "description": "Unauthorized" } }
+      }
+    },
+    "/checkout/whatsapp": {
+      "post": {
+        "operationId": "checkoutWhatsApp",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CheckoutRequest" } } } },
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CheckoutResponse" } } } } }
+      }
+    }
+  }
+}
+
+
