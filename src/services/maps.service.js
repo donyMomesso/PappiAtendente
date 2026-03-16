@@ -46,9 +46,16 @@ async function quoteByAddress(addressText) {
 
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
 
+  const MAX_DELIVERY_KM = 7;
+
   const km = distanceKm(Number(ENV.STORE_LAT), Number(ENV.STORE_LNG), lat, lng);
-  const etaMinutes = Math.max(20, Math.round(km * 4 + 20)); // heurística simples
-  const deliveryFee = Math.max(0, Math.round(km * 2)); // heurística simples
+  const etaMinutes = Math.max(20, Math.round(km * 4 + 20));
+
+  // Taxa real: R$ 5 no primeiro km, +R$ 5 a cada 1,5 km, máximo R$ 18, raio máximo 7 km
+  const extraKm = Math.max(0, km - 1);
+  const deliveryFee = km > MAX_DELIVERY_KM
+    ? null
+    : Math.min(18, 5 + Math.ceil(extraKm / 1.5) * 5);
 
   return {
     formatted_address: r.formatted_address,
@@ -57,7 +64,7 @@ async function quoteByAddress(addressText) {
     km: round(km, 1),
     eta_minutes: etaMinutes,
     delivery_fee: deliveryFee,
-    is_serviceable: true,
+    is_serviceable: km <= MAX_DELIVERY_KM,
   };
 }
 

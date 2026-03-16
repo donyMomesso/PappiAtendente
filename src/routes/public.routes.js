@@ -1,3 +1,4 @@
+// @ts-nocheck
 // src/routes/public.routes.js
 const express = require("express");
 const ENV = require("../config/env");
@@ -7,12 +8,12 @@ const fetch = global.fetch || require("node-fetch");
 
 const { loadRulesFromFiles } = require("../rules/loader");
 const { getMode } = require("../services/context.service");
-const { getUpsellHint } = require("../services/upsell.service");
+const { getUpsellHint, TOP_PIZZAS, COMBOS_SALGADAS, COMBOS_DOCES } = require("../services/upsell.service");
 const { quoteDeliveryIfPossible, MAX_KM } = require("../services/deliveryQuote.service");
 const { createPixCharge } = require("../services/interPix.service");
 
 // Cardápio Web (CORRETO: dupla autenticação)
-const { createOrder, getPaymentMethods, getCwCustomerByPhone, getCwOrderById, getMerchant } = require("../services/cardapioWeb.service");
+const { createOrder, cancelOrder, getPaymentMethods, getCwCustomerByPhone, getCwOrderById, getMerchant } = require("../services/cardapioWeb.service");
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -177,6 +178,8 @@ async function askDeescalationButtons(to) {
 // ===================================================
 const askedName = new Set();
 const orderDraft = new Map();
+const pendingNewOrder = new Map(); // payload aguardando decisão de acrescentar vs novo pedido
+const feeCache = new Map(); // address → { fee, lat, lng, formatted, ts } — evita chamar Maps+CW a cada mensagem
 
 function getDraft(phone) { return orderDraft.get(phone) || null; }
 function setDraft(phone, text) { orderDraft.set(phone, { text: String(text || "").slice(0, 700), updatedAt: Date.now() }); }
@@ -217,6 +220,72 @@ function buildOrderSummary(items) {
   }).join(", ").slice(0, 200);
 }
 
+function formatPhoneBR(phone) {
+  const d = String(phone || "").replace(/\D/g, "").replace(/^55/, "");
+  if (d.length === 11) return `(${d.slice(0,2)}) ${d.slice(2,7)}-${d.slice(7)}`;
+  if (d.length === 10) return `(${d.slice(0,2)}) ${d.slice(2,6)}-${d.slice(6)}`;
+  return phone;
+}
+
+function buildOrderReceipt({ payload, customer, displayId, cwDisplayId, payList }) {
+  const now = new Date();
+  const datePart = now.toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", year: "numeric" });
+  const timePart = now.toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" });
+  const isDelivery = payload.order_type === "delivery";
+
+  // Cabeçalho
+  let txt = `#️⃣  *Pedido Nº ${cwDisplayId || displayId}*\n`;
+  txt += `feito em ${datePart} ${timePart}\n\n`;
+
+  // Cliente
+  txt += `👤  *${customer.name || "Cliente"}*\n`;
+  txt += `📞  ${formatPhoneBR(customer.phone)}\n\n`;
+
+  // Endereço
+  if (isDelivery && payload.delivery_address) {
+    const addr = payload.delivery_address;
+    txt += `🛵  *Endereço de entrega*\n`;
+    const street = [addr.street_name, addr.street_number].filter(Boolean).join(", ");
+    if (street) txt += `${street}\n`;
+    if (addr.complement) txt += `Complemento: ${addr.complement}\n`;
+    if (addr.reference) txt += `Referência: ${addr.reference}\n`;
+    const cityParts = [addr.neighborhood, addr.city ? `${addr.city}/SP` : null].filter(Boolean).join(", ");
+    if (cityParts) txt += `${cityParts}\n`;
+    txt += "\n";
+  }
+
+  // Itens
+  txt += `------ ITENS DO PEDIDO ------\n\n`;
+  for (const item of (payload.items || [])) {
+    txt += `*${item.quantity} x ${item.name}*\n`;
+    const optNames = (item.options || []).map(o => o.name).filter(Boolean);
+    if (optNames.length > 0) txt += `➡️ ${optNames.join(", ")}\n`;
+    if (item.observation) txt += `❗ OBS: ${item.observation}\n`;
+    const priceStr = `R$ ${Number(item.unit_price).toFixed(2).replace(".", ",")}`;
+    const totalStr = `R$ ${Number(item.total_price).toFixed(2).replace(".", ",")}`;
+    txt += `💵 ${item.quantity} x ${priceStr} = ${totalStr}\n\n`;
+  }
+  txt += `-----------------------------\n\n`;
+
+  // Totais
+  const subtotal = (payload.totals?.order_amount || 0) - (payload.totals?.delivery_fee || 0);
+  txt += `SUBTOTAL: R$ ${Number(subtotal).toFixed(2).replace(".", ",")}\n`;
+  if (isDelivery) txt += `ENTREGA: R$ ${Number(payload.totals?.delivery_fee || 0).toFixed(2).replace(".", ",")}\n`;
+  if (payload.totals?.discounts > 0) txt += `DESCONTO: -R$ ${Number(payload.totals.discounts).toFixed(2).replace(".", ",")}\n`;
+  txt += `\n*VALOR FINAL: R$ ${Number(payload.totals?.order_amount || 0).toFixed(2).replace(".", ",")}*\n`;
+
+  // Pagamento
+  const pmId = payload.payments?.[0]?.payment_method_id;
+  const pmName = Array.isArray(payList) && pmId
+    ? (payList.find(p => p.id === pmId)?.name || null)
+    : null;
+  const pmLabel = pmName || (customer.preferredPayment === "pix" ? "PIX" : customer.preferredPayment === "cartao" ? "Cartão" : "Dinheiro");
+  const pmTotal = `R$ ${Number(payload.payments?.[0]?.total || payload.totals?.order_amount || 0).toFixed(2).replace(".", ",")}`;
+  txt += `\n💲  *FORMA DE PAGAMENTO*\n${pmLabel}: ${pmTotal}\n`;
+
+  return txt;
+}
+
 function looksLikeOrderIntent(text) {
   const t = String(text || "").toLowerCase().trim();
   if (!t) return false;
@@ -250,7 +319,14 @@ function extractCep(text) {
   return null;
 }
 function extractHouseNumber(text) { const m = String(text || "").match(/\b\d{1,5}\b/); return m ? m[0] : null; }
-function looksLikeNoComplement(text) { return /^(sem|não tem|nao tem)\s*(complemento)?$/i.test(String(text || "").trim()); }
+function looksLikeNoComplement(text) {
+  const t = String(text || "").trim().toLowerCase();
+  // "nao", "não", "sem", "nenhum" — com ou sem o que vem depois (ex: "nao 53")
+  return /^(n[aã]o|sem|nenhum)(\s|$)/.test(t) || /^(n[aã]o tem|n[aã]o precisa)\s*(complemento)?$/i.test(t);
+}
+function detectCancelRequest(text) {
+  return /\b(cancel(ar?|a|ei)|desist(ir|o)|n[aã]o (quero|vou) (mais|o pedido)|desejo cancelar)\b/i.test(String(text || ""));
+}
 
 function looksLikeAddress(text) {
   const t = String(text || "").toLowerCase().trim();
@@ -371,6 +447,17 @@ async function askPaymentButtons(to) {
     { id: "PAY_CARTAO", title: "💳 Cartão" },
     { id: "PAY_DINHEIRO", title: "💵 Dinheiro" },
   ]);
+}
+
+async function askDuplicateOrderButtons(to, existingDisplayId) {
+  return sendButtons(
+    to,
+    `Você já tem um pedido em andamento (*#${existingDisplayId}*). O que prefere?`,
+    [
+      { id: "ORDER_ADD", title: "Acrescentar ao pedido" },
+      { id: "ORDER_NEW", title: "Novo pedido separado" },
+    ]
+  );
 }
 
 // ===================================================
@@ -976,12 +1063,14 @@ router.get("/debug/menu", async (req, res) => {
 // WEBHOOK CARDAPIO WEB (status/pedidos)
 // ===================================================
 const CW_STATUS_MSG = {
-  confirmed:       "✅ Pedido confirmado! Estamos preparando com carinho 🍕",
-  ready:           "🔔 Seu pedido está pronto!",
-  released:        "🛵 Seu pedido saiu para entrega! Em breve estará aí.",
-  waiting_to_catch:"🔔 Pedido pronto para retirada! Pode vir buscar 😊",
-  delivered:       "🎉 Pedido entregue! Bom apetite 😋",
-  canceled:        "❌ Seu pedido foi cancelado. Qualquer dúvida é só chamar.",
+  waiting_confirmation: "⏳ Pedido recebido! Aguardando confirmação da loja...",
+  confirmed:            "✅ Pedido confirmado pela loja! Logo entra em preparo 🍕",
+  in_production:        "👨‍🍳 Seu pedido entrou em produção! Estamos fazendo com carinho.",
+  ready:                "🔔 Seu pedido está pronto!",
+  released:             "🛵 Seu pedido saiu para entrega! Em breve estará aí.",
+  waiting_to_catch:     "🔔 Pedido pronto para retirada! Pode vir buscar 😊",
+  delivered:            "🎉 Pedido entregue! Bom apetite 😋",
+  canceled:             "❌ Seu pedido foi cancelado. Qualquer dúvida é só chamar.",
 };
 
 router.post("/cardapioweb/webhook", async (req, res) => {
@@ -991,10 +1080,15 @@ router.post("/cardapioweb/webhook", async (req, res) => {
     const body = req.body || {};
     console.log("📩 CardapioWeb webhook:", JSON.stringify(body, null, 2));
 
-    // CW pode mandar { event, data: order }, { orders: [...] } ou o Order direto
-    const order = body.data || (Array.isArray(body.orders) ? body.orders[0] : null) || body;
-    const cwId  = order?.id ? String(order.id) : null;
-    const status = order?.status;
+    // CW manda: { event_type, order_id, order_status } OU { data: order } OU order direto
+    const cwId = String(
+      body.order_id || body.data?.id || body.id ||
+      (Array.isArray(body.orders) ? body.orders[0]?.id : null) || ""
+    ) || null;
+    const status = String(
+      body.order_status || body.data?.status || body.status ||
+      (Array.isArray(body.orders) ? body.orders[0]?.status : null) || ""
+    ).toLowerCase().replace(/-/g, "_");
 
     if (!status || !cwId) return;
 
@@ -1032,6 +1126,22 @@ router.post("/cardapioweb/webhook", async (req, res) => {
         ? prisma.order.update({ where: { id: dbOrder.id }, data: { status } }).catch(() => null)
         : Promise.resolve(),
     ]);
+
+    // Mensagem de avaliação Google — apenas quando sai pra entrega e não está atrasado
+    if (status === "released" && dbOrder) {
+      const GOOGLE_REVIEW_URL = ENV.GOOGLE_REVIEW_URL || null;
+      const ETA_MAX_MS = 65 * 60 * 1000; // 65 min: se passou disso, considera atrasado
+      const ageMs = Date.now() - new Date(dbOrder.createdAt).getTime();
+      const isLate = ageMs > ETA_MAX_MS;
+
+      if (!isLate && GOOGLE_REVIEW_URL) {
+        await new Promise(r => setTimeout(r, 3000)); // pequena pausa pra não parecer robótico
+        await sendText(
+          waPhone,
+          `Sua pizza tá a caminho! 🍕❤️\n\nSe a experiência foi boa, nos ajuda muito com uma avaliação de *5 estrelas* no Google — leva só 10 segundinhos e faz toda diferença pra nossa equipe:\n👉 ${GOOGLE_REVIEW_URL}\n\nObrigado de coração! 😊`
+        );
+      }
+    }
   } catch (e) {
     console.error("❌ Erro no webhook CardapioWeb:", e);
   }
@@ -1084,7 +1194,7 @@ router.post("/webhook/inter", async (req, res) => {
             await prisma.order.update({
               where: { id: order.id },
               data: {
-                status: String(cwResp?.status || "waiting_confirmation"),
+                status: String(cwResp?.status || "waiting_confirmation").toLowerCase(),
                 cwOrderId: cwResp?.id ? String(cwResp.id) : undefined,
               }
             }).catch(() => null);
@@ -1140,6 +1250,7 @@ router.post("/webhook", async (req, res) => {
     // --------- INTERACTIVE (botões) ----------
     if (msg.type === "interactive") {
       const btnId = msg?.interactive?.button_reply?.id || null;
+      let proceedToAI = false;
 
       if (btnId === "REPEAT_LAST_ORDER") {
         // VIP quer repetir o pedido de sempre — lança direto pro Gemini com contexto
@@ -1248,6 +1359,14 @@ router.post("/webhook", async (req, res) => {
           data: { preferredPayment: v, lastInteraction: new Date() }
         }).catch(() => customer);
         pushHistory(from, "user", `BOTÃO: pagamento ${v}`);
+
+        const payDraft = getDraft(from);
+        if (payDraft) {
+          proceedToAI = true;
+          msg.type = "text";
+          if (!msg.text) msg.text = {};
+          msg.text.body = payDraft.text;
+        }
       }
 
       if (btnId === "ADDR_CONFIRM") {
@@ -1286,18 +1405,83 @@ router.post("/webhook", async (req, res) => {
         return;
       }
 
-      if (!customer.name && !askedName.has(from)) {
-        askedName.add(from);
-        await sendText(from, "Show 😊 qual seu nome?");
+      if (btnId === "ORDER_ADD") {
+        const pending = pendingNewOrder.get(from);
+        pendingNewOrder.delete(from);
+        if (!pending) {
+          await sendText(from, "Nao encontrei o pedido pendente. Me diz o que quer acrescentar.");
+          return;
+        }
+        // Cria o pedido com observacao indicando que e acrescimo
+        const activeOrder = await prisma.order.findFirst({
+          where: { customerId: customer.id, status: { in: ["waiting_confirmation", "confirmed", "in_production"] } },
+          orderBy: { createdAt: "desc" }
+        }).catch(() => null);
+        const obsPrefix = activeOrder ? `ACRESCENTAR AO PEDIDO #${activeOrder.displayId} - ` : "ACRESCIMO - ";
+        pending.payload.observation = obsPrefix + (pending.payload.observation || "Pedido via WhatsApp");
+        try {
+          const cwResp = await createOrder(pending.payload);
+          await prisma.order.create({
+            data: {
+              displayId: pending.txid,
+              cwOrderId: cwResp?.id ? String(cwResp.id) : undefined,
+              status: String(cwResp?.status || "waiting_confirmation").toLowerCase(),
+              total: pending.payload.totals.order_amount,
+              items: "Acrescimo ao pedido",
+              customerId: customer.id
+            }
+          }).catch(() => null);
+          await sendText(from, `Anotado. O item foi enviado com a observacao "${obsPrefix}" pra cozinha nao duplicar.`);
+        } catch (e) {
+          await sendText(from, "Erro ao enviar o acrescimo. Tenta de novo ou chama um atendente.");
+        }
+        clearDraft(from);
         return;
       }
-      if (!customer.lastFulfillment) { await askFulfillmentButtons(from); return; }
-      if (customer.lastFulfillment === "entrega" && !customer.lastAddress) {
-        await sendText(from, "Pra entrega, me manda *CEP* ou *Rua + Número + Bairro* (ou sua localização 📍) pra eu calcular a taxa 😊");
+
+      if (btnId === "ORDER_NEW") {
+        const pending = pendingNewOrder.get(from);
+        pendingNewOrder.delete(from);
+        if (!pending) {
+          await sendText(from, "Nao encontrei o pedido pendente. Me diz o que quer pedir.");
+          return;
+        }
+        try {
+          const cwResp = await createOrder(pending.payload);
+          const receipt = buildOrderReceipt({ payload: pending.payload, customer, displayId: pending.txid, cwDisplayId: cwResp?.display_id || cwResp?.id, payList: null });
+          await prisma.order.create({
+            data: {
+              displayId: pending.txid,
+              cwOrderId: cwResp?.id ? String(cwResp.id) : undefined,
+              status: String(cwResp?.status || "waiting_confirmation").toLowerCase(),
+              total: pending.payload.totals.order_amount,
+              items: "Novo pedido separado",
+              customerId: customer.id
+            }
+          }).catch(() => null);
+          await sendText(from, receipt);
+          await sendText(from, "Pedido separado enviado. Aguardando confirmacao da loja.");
+        } catch (e) {
+          await sendText(from, "Erro ao enviar o pedido. Tenta de novo ou chama um atendente.");
+        }
+        clearDraft(from);
         return;
       }
-      await sendText(from, "Fechado 🙌 Qual pizza você quer? (tamanho + sabor, ou meia a meia)");
-      return;
+
+      if (!proceedToAI) {
+        if (!customer.name && !askedName.has(from)) {
+          askedName.add(from);
+          await sendText(from, "Show 😊 qual seu nome?");
+          return;
+        }
+        if (!customer.lastFulfillment) { await askFulfillmentButtons(from); return; }
+        if (customer.lastFulfillment === "entrega" && !customer.lastAddress) {
+          await sendText(from, "Pra entrega, me manda *CEP* ou *Rua + Número + Bairro* (ou sua localização 📍) pra eu calcular a taxa 😊");
+          return;
+        }
+        await sendText(from, "Fechado 🙌 Qual pizza você quer? (tamanho + sabor, ou meia a meia)");
+        return;
+      }
     }
 
     // --------- LOCATION ----------
@@ -1402,6 +1586,48 @@ router.post("/webhook", async (req, res) => {
       return;
     }
 
+    if (detectCancelRequest(userText)) {
+      pushHistory(from, "user", userText);
+      const CANCEL_WINDOW_MS = 12 * 60 * 1000; // 12 minutos
+      const lastOrder = await prisma.order.findFirst({
+        where: { customerId: customer.id, status: { not: { in: ["canceled", "delivered"] } } },
+        orderBy: { createdAt: "desc" }
+      }).catch(() => null);
+
+      if (!lastOrder) {
+        await sendText(from, "Não encontrei nenhum pedido ativo. Se precisar de ajuda é só chamar! 😊");
+        return;
+      }
+
+      const ageMs = Date.now() - new Date(lastOrder.createdAt).getTime();
+      const withinWindow = ageMs <= CANCEL_WINDOW_MS;
+      const cancellable = withinWindow && ["waiting_confirmation", "confirmed"].includes(lastOrder.status);
+
+      if (!cancellable) {
+        const reason = !withinWindow
+          ? "já passou do prazo de cancelamento (12 min)"
+          : `o pedido está com status *${lastOrder.status}* e já pode estar em preparo`;
+        await sendText(from, `Infelizmente não consigo cancelar automaticamente — ${reason}.\nVou chamar um atendente para verificar com a loja. 📞`);
+        await setHandoffOn(from);
+        return;
+      }
+
+      if (lastOrder.cwOrderId) {
+        const result = await cancelOrder(lastOrder.cwOrderId);
+        if (result.ok) {
+          await prisma.order.update({ where: { id: lastOrder.id }, data: { status: "canceled" } }).catch(() => null);
+          await sendText(from, `✅ Pedido *#${lastOrder.displayId}* cancelado com sucesso! Se precisar de mais alguma coisa é só chamar. 😊`);
+        } else {
+          await sendText(from, `Não consegui cancelar automaticamente 😕 Vou chamar um atendente pra resolver agora. 📞`);
+          await setHandoffOn(from);
+        }
+      } else {
+        await sendText(from, `Vou chamar um atendente pra cancelar o pedido *#${lastOrder.displayId}*. 📞`);
+        await setHandoffOn(from);
+      }
+      return;
+    }
+
     const nm = extractNameLight(userText);
     const ff = detectFulfillmentLight(userText);
     const pay = detectPaymentLight(userText);
@@ -1503,21 +1729,34 @@ router.post("/webhook", async (req, res) => {
         const n = extractHouseNumber(t);
         if (!n) { await sendText(from, "Me diz só o *número* da casa 😊"); return; }
         af.number = n;
-        // Se já temos rua e bairro do ViaCEP, pula direto pro complemento
-        if (af.street && af.bairro) {
-          af.step = "ASK_COMPLEMENTO";
-          await sendText(from, "Tem *complemento*? (apto, bloco, etc.) Se não tiver, diga *sem*.");
+        // Tenta geocodificar direto com rua + número
+        const qNum = buildAddressText(af);
+        const dNum = await safeQuote(qNum);
+        if (dNum?.ok) {
+          if (dNum.within === false) { await sendText(from, `Ainda não entregamos aí (até ${MAX_KM} km). Quer *Retirada*?`); return; }
+          af.pending = { formatted: dNum.formatted, lat: dNum.lat, lng: dNum.lng };
+          af.step = null;
+          await askAddressConfirm(from, dNum.formatted, dNum);
         } else {
           af.step = "ASK_BAIRRO";
-          await sendText(from, "Boa! Qual o *bairro*?");
+          await sendText(from, "Qual o *bairro*? 😊");
         }
         return;
       }
 
       if (af.step === "ASK_BAIRRO") {
         af.bairro = t.slice(0, 80);
-        af.step = "ASK_COMPLEMENTO";
-        await sendText(from, "Tem *complemento*? Se não tiver, diga *sem*.");
+        const qBairro = buildAddressText(af);
+        const dBairro = await safeQuote(qBairro);
+        if (dBairro?.ok) {
+          if (dBairro.within === false) { await sendText(from, `Ainda não entregamos aí (até ${MAX_KM} km). Quer *Retirada*?`); return; }
+          af.pending = { formatted: dBairro.formatted, lat: dBairro.lat, lng: dBairro.lng };
+          af.step = null;
+          await askAddressConfirm(from, dBairro.formatted, dBairro);
+        } else {
+          af.step = "ASK_COMPLEMENTO";
+          await sendText(from, "Tem *complemento*? Se não tiver, diga *sem*.");
+        }
         return;
       }
 
@@ -1557,8 +1796,16 @@ router.post("/webhook", async (req, res) => {
 
         af.street = t.slice(0, 120);
         af.number = num;
-        af.step = "ASK_BAIRRO";
-        await sendText(from, "Show! Qual é o *bairro*? 😊");
+        const qInline = buildAddressText(af);
+        const dInline = await safeQuote(qInline);
+        if (dInline?.ok) {
+          if (dInline.within === false) { await sendText(from, `Ainda não entregamos aí (até ${MAX_KM} km). Quer *Retirada*?`); return; }
+          af.pending = { formatted: dInline.formatted, lat: dInline.lat, lng: dInline.lng };
+          await askAddressConfirm(from, dInline.formatted, dInline);
+        } else {
+          af.step = "ASK_BAIRRO";
+          await sendText(from, "Show! Qual é o *bairro*? 😊");
+        }
         return;
       }
 
@@ -1568,11 +1815,19 @@ router.post("/webhook", async (req, res) => {
     }
 
     // -----------------------------------------
-    // taxa de entrega (se já tem endereço)
+    // taxa de entrega (se já tem endereço) — cache 30 min por endereço
     // -----------------------------------------
     if (customer.lastFulfillment === "entrega" && customer.lastAddress) {
-      const finalCota = await safeQuote(customer.lastAddress);
-      currentFee = finalCota?.fee != null ? Number(finalCota.fee) : 0;
+      const cacheKey = customer.lastAddress;
+      const cached = feeCache.get(cacheKey);
+      if (cached && Date.now() - cached.ts < 30 * 60 * 1000) {
+        currentFee = cached.fee;
+      } else {
+        const finalCota = await safeQuote(customer.lastAddress);
+        currentFee = finalCota?.fee != null ? Number(finalCota.fee) : 0;
+        feeCache.set(cacheKey, { fee: currentFee, ts: Date.now() });
+        if (feeCache.size > 500) feeCache.clear();
+      }
     }
 
     if (!customer.preferredPayment) {
@@ -1600,6 +1855,29 @@ router.post("/webhook", async (req, res) => {
     const historyText = getHistoryText(from);
     const upsell = getUpsellHint({ historyText, userText });
     const pedidoTxt = getDraft(from)?.text || "";
+
+    // Filtra sugestoes contra o menu real (evita sugerir pizza em falta ou inativa)
+    const menuRawItems = (menuCache.raw?.categories || [])
+      .flatMap(c => c.items || [])
+      .filter(i => i.status === "ACTIVE")
+      .map(i => i.name.toLowerCase());
+
+    const norm = s => s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const isInMenu = name => menuRawItems.some(m => norm(m).includes(norm(name.split(" ")[0])) || norm(name).split(" ").slice(0,2).every(w => norm(m).includes(w)));
+
+    const topPizzasDisponiveis = TOP_PIZZAS.filter(p => isInMenu(p.name));
+    const combosSalgadosDisponiveis = COMBOS_SALGADAS.filter(c =>
+      c.split("+").every(part => {
+        const sabor = part.replace(/1\/2/g, "").trim();
+        return isInMenu(sabor);
+      })
+    );
+    const combosDocesDisponiveis = COMBOS_DOCES.filter(c =>
+      c.split("+").every(part => {
+        const sabor = part.replace(/1\/2/g, "").trim();
+        return isInMenu(sabor);
+      })
+    );
 
     const disc = detectDISC(historyText, userText);
     const tone = discToneGuidance(disc);
@@ -1642,9 +1920,23 @@ ${customerMemory}
 FOCO ABSOLUTO NO PEDIDO:
 - Você é um atendente de pizzaria. Seu único objetivo é receber o pedido e fechar a venda.
 - Se o cliente mandar algo fora do contexto (piada, pergunta aleatória, assunto não relacionado), responda de forma breve e simpática e IMEDIATAMENTE redirecione pro pedido.
-- Exemplos de redirecionamento: "haha, boa! 😄 Mas vamos lá, o que você vai pedir?" | "Que isso! 😂 Mas vamos fechar seu pedido, que tal?"
-- NUNCA entre em conversas longas fora do pedido. Máx 1 frase fora do contexto, depois volta pro roteiro.
+- Exemplos de redirecionamento: "haha, boa! Mas vamos lá, o que você vai pedir?" | "Que isso! Mas vamos fechar seu pedido, que tal?"
+- NUNCA entre em conversas longas fora do pedido. Max 1 frase fora do contexto, depois volta pro roteiro.
 - Se o cliente perguntar algo sobre a loja (endereço, horário, ingredientes), responda brevemente e volte pro pedido.
+
+QUANDO O CLIENTE PEDIR O CARDAPIO:
+- O link já foi enviado na saudação. NAO mande o link de novo sem motivo.
+- Se for cliente novo: "O cardapio ta aqui: ${LINK_CARDAPIO} Ja tem algo em mente ou quer uma sugestao?"
+- Se for cliente fiel com historico: NAO mande o link de cara. Diga "Da ultima vez voce foi de [ultimo pedido], quer repetir ou experimentar algo novo?" — so mande o link se ele pedir de novo.
+- Sempre termine com uma pergunta que direcione pro fechamento do pedido.
+
+RESPOSTAS CURTAS - REGRA DE OURO:
+- NUNCA liste todas as opções de sabores disponíveis. As pessoas não leem textos longos no WhatsApp.
+- Quando o cliente pedir um sabor genérico (ex: "frango", "calabresa"), responda diretamente com o sabor mais popular: "Frango com Catupiry" ou "Calabresa Tradicional". Se ele quiser outro, ele fala.
+- Exemplo CORRETO: Cliente: "meia frango meia calabresa" → Você: "Fechado! Frango com Catupiry e Calabresa Tradicional? Quer adicionar borda ou bebida?"
+- Exemplo ERRADO: listar 5 opções de frango para o cliente escolher.
+- Só pergunte o sabor exato se o cardápio tiver DOIS ou menos sabores daquela categoria.
+- Máximo 2 perguntas por mensagem. Se precisar de mais info, pegue a mais importante primeiro.
 
 REGRAS DE ATENDIMENTO (MUITO IMPORTANTE):
 - Já sabemos: Nome: ${customer.name} | Envio: ${customer.lastFulfillment} | Pagamento (preferência): ${customer.preferredPayment || "não definido"}
@@ -1655,17 +1947,46 @@ REGRAS DE ATENDIMENTO (MUITO IMPORTANTE):
 - PROIBIDO EXPLICAR REGRA DE PREÇO: Se for meio a meio, NÃO diga “cobra o mais caro”/“pelo mais caro”. Apenas informe o TOTAL final.
 - BEBIDAS: Ofereça somente bebidas que existam na lista "BEBIDAS DISPONÍVEIS" abaixo.
 - SABORES GENÉRICOS: Se o cliente pedir "frango" e existir mais de um frango no cardápio, liste as opções (sem IDs) e pergunte qual prefere.
-- CLIENTE INDECISO: Se o cliente disser "não sei", "o que você recomenda", "me sugere algo" ou similar, sugira 2 ou 3 opções do CARDÁPIO com uma frase curta sobre cada. Nunca invente itens que não estão no cardápio.
 - 1 pergunta por vez.
 - Se o cliente ainda não escolheu tamanho + sabores, conduza pra isso.
 - Sempre que fizer RESUMO final, peça confirmação: "Posso confirmar?"
 
+SUGESTAO ESTRATEGICA (gatilhos psicologicos):
+Dica atual do sistema: ${upsell || "nenhuma"}
+
+Pizzas prioritarias para sugerir (maior lucro e mais pedidas — use estas quando o cliente estiver indeciso ou pedir sugestao):
+${topPizzasDisponiveis.map((p, i) => `${i + 1}. ${p.name} - ${p.tag}`).join("\n") || "Consulte o cardapio."}
+
+Quando o cliente pedir sugestao ou parecer indeciso:
+- Sugira 2 das pizzas prioritarias acima com prova social. Ex: "A Costela com Catupiry e Pimenta Biquinho e muito elogiada, e a Frango com Catupiry e classica. Qual te agrada mais?"
+- Nunca liste mais de 3 opcoes de uma vez.
+
+Combos meia a meia salgada mais pedidos (apenas os disponiveis agora):
+${combosSalgadosDisponiveis.slice(0, 3).join(" | ") || "Consulte o cardapio."}
+
+Combos doces mais pedidos (apenas os disponiveis agora):
+${combosDocesDisponiveis.join(" | ") || "Consulte o cardapio."}
+
+ANCORA DE TAMANHO (use sempre apos o cliente escolher o sabor):
+- "A maioria pede a de 16 pedacos — compensa mais e da pra dividir melhor. Voce prefere 8 ou 16?"
+- NUNCA pergunte tamanho sem ancorar no 16 como mais popular.
+
+UPSELL DE DOCE (use apos fechar o pedido principal, antes do resumo):
+- Se o cliente nao pediu pizza doce, sugira uma: "Quer aproveitar e fechar com uma pizza doce? As favoritas sao Duo (chocolate ao leite + branco) e Charge (chocolate, doce de leite e amendoim)."
+- So pergunte UMA VEZ. Se recusar, aceite e siga.
+
+UPSELL DE BORDA E BEBIDA:
+- Apos escolher a pizza, sugira borda com frase curta e emocional. Ex: "Borda de catupiry faz toda diferenca nessa pizza 🤤 Quer adicionar?"
+- Se tiver pedido pizza grande, sugira Coca 2L. Ex: "Coca 2L pra acompanhar?"
+- Uma sugestao por vez, nunca as duas juntas.
+
 ROTEIRO:
-1) Confirme tamanho + sabores
-2) Ofereça borda + 1 bebida (da lista)
-3) Pergunte observações
-4) Se dinheiro, pergunte troco
-5) Faça resumo e total exato (inclui taxa R$ ${Number(currentFee).toFixed(2)})
+1) Confirme tamanho (ancora no 16) + sabores
+2) Ofereça borda com frase emocional + 1 bebida
+3) Sugira doce (1x apenas)
+4) Pergunte observacoes
+5) Se dinheiro, pergunte troco
+6) Faca resumo e total exato (inclui taxa R$ ${Number(currentFee).toFixed(2)})
 
 IMPORTANTE SOBRE STATUS:
 - Quando o pedido for criado via integração, ele entra como "aguardando confirmação/preparo".
@@ -1905,6 +2226,18 @@ ${historyText}
         return;
       }
 
+      // Verifica se ja tem pedido ativo — evita duplicacao na cozinha
+      const activeOrder = await prisma.order.findFirst({
+        where: { customerId: customer.id, status: { in: ["waiting_confirmation", "confirmed", "in_production"] } },
+        orderBy: { createdAt: "desc" }
+      }).catch(() => null);
+
+      if (activeOrder) {
+        pendingNewOrder.set(from, { payload: finalOrderPayload, txid });
+        await askDuplicateOrderButtons(from, activeOrder.displayId);
+        return;
+      }
+
       // Dinheiro ou cartão: cria pedido direto
       try {
         const cwResp = await createOrder(finalOrderPayload);
@@ -1915,7 +2248,7 @@ ${historyText}
             data: {
               displayId: txid,
               cwOrderId: cwResp?.id ? String(cwResp.id) : undefined,
-              status: String(cwResp?.status || "waiting_confirmation"),
+              status: String(cwResp?.status || "waiting_confirmation").toLowerCase(),
               total: finalOrderPayload.totals.order_amount,
               items: "Pedido Dinheiro/Cartao",
               customerId: customer.id
@@ -1930,17 +2263,15 @@ ${historyText}
           }).catch(() => null),
         ]);
 
-        if (resposta) await sendText(from, resposta);
-
-        // MENSAGEM CERTA (sem “motoboy a caminho”)
-        const etaMsg = (customer.lastFulfillment === "entrega")
-          ? `⏱️ Tempo estimado de entrega: *${ETA_DELIVERY}*`
-          : `⏱️ Tempo estimado de retirada: *${ETA_TAKEOUT}*`;
-
-        await sendText(
-          from,
-          `✅ Pedido registrado no sistema da loja.\nStatus: *Aguardando confirmação / preparo*.\n${etaMsg}\nVocê vai recebendo as atualizações por aqui.`
-        );
+        const receipt = buildOrderReceipt({
+          payload: finalOrderPayload,
+          customer,
+          displayId: txid,
+          cwDisplayId: cwResp?.display_id || cwResp?.id,
+          payList,
+        });
+        await sendText(from, receipt);
+        await sendText(from, ['Aguardando confirmacao da loja.', 'Voce recebera uma atualizacao por aqui assim que confirmarem.'].join(' '));
 
         clearDraft(from);
         pushHistory(from, "assistant", "[PEDIDO CRIADO NO CARDAPIOWEB - WAITING_CONFIRMATION]");

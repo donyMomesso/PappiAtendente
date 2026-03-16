@@ -181,8 +181,92 @@ async function getCwOrderById(orderId) {
   }
 }
 
+/**
+ * Busca a taxa de entrega real no CW para um endereço/coordenadas.
+ * Tenta: POST /delivery_fee com coords, depois GET /merchant/delivery_areas.
+ * Retorna o valor em reais (número) ou null se não encontrar.
+ */
+async function getDeliveryFee({ lat, lng, address } = {}) {
+  try {
+    // Tentativa 1: endpoint de cálculo de taxa por coordenadas
+    if (lat != null && lng != null) {
+      const url = `${cwBase()}/api/partner/v1/delivery_fee`;
+      const resp = await fetchWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: cwHeadersPartner(),
+          body: JSON.stringify({ latitude: lat, longitude: lng })
+        },
+        10000
+      );
+      const data = await safeJson(resp);
+      if (resp.ok && data != null) {
+        const fee = parseFloat(data?.delivery_fee ?? data?.fee ?? data?.value ?? data);
+        if (Number.isFinite(fee)) return fee;
+      }
+    }
+
+    // Tentativa 2: lista de áreas de entrega do merchant
+    const url2 = `${cwBase()}/api/partner/v1/merchant/delivery_areas`;
+    const resp2 = await fetchWithTimeout(url2, { headers: cwHeadersPartner() }, 10000);
+    const data2 = await safeJson(resp2);
+    if (resp2.ok && Array.isArray(data2) && data2.length > 0) {
+      // Retorna a menor taxa como referência (sem coordenadas pra comparar zona)
+      const fees = data2.map(a => parseFloat(a.fee ?? a.delivery_fee ?? a.price ?? 0)).filter(Number.isFinite);
+      if (fees.length > 0) return Math.min(...fees);
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cancela um pedido no CW pelo ID do pedido (cwOrderId).
+ * Tenta PATCH /orders/{id}/cancel primeiro; se falhar, tenta PATCH /orders/{id} com status canceled.
+ */
+async function cancelOrder(cwOrderId) {
+  const base = cwBase();
+  const headers = cwHeadersPartner();
+  const jsonHeaders = { ...headers, "Content-Type": "application/json" };
+
+  const attempts = [
+    // 1: PATCH /orders/{id}/cancel (sem body)
+    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}/cancel`, { method: "PATCH", headers }, 10000),
+    // 2: POST /orders/{id}/cancel
+    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}/cancel`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({}) }, 10000),
+    // 3: POST /orders/{id}/events com status CANCELLED
+    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}/events`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ status: "CANCELLED" }) }, 10000),
+    // 4: POST /orders/{id}/events com action cancel
+    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}/events`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ action: "cancel" }) }, 10000),
+    // 5: PATCH /orders/{id} com status lowercase
+    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}`, { method: "PATCH", headers: jsonHeaders, body: JSON.stringify({ status: "canceled" }) }, 10000),
+    // 6: PATCH /orders/{id} com status uppercase (padrão CW)
+    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}`, { method: "PATCH", headers: jsonHeaders, body: JSON.stringify({ status: "CANCELLED" }) }, 10000),
+    // 7: PUT /orders/{id}
+    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ status: "CANCELLED" }) }, 10000),
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const resp = await attempt();
+      const data = await safeJson(resp);
+      console.log(`CW cancelOrder ${cwOrderId} → ${resp.status}`, JSON.stringify(data));
+      if (resp.ok) return { ok: true, data };
+    } catch (e) {
+      console.warn("CW cancelOrder attempt failed:", e.message);
+    }
+  }
+
+  return { ok: false, error: "Todos os endpoints de cancelamento falharam" };
+}
+
 module.exports = {
   createOrder,
+  cancelOrder,
+  getDeliveryFee,
   getPaymentMethods,
   getCatalogRaw,
   getCwCustomerByPhone,

@@ -2,7 +2,7 @@
 const ENV = require("../config/env");
 const maps = require("./maps.service");
 
-const MAX_KM = Number(process.env.DELIVERY_MAX_KM || 12);
+const MAX_KM = Number(process.env.DELIVERY_MAX_KM || 7);
 
 function hasEnoughAddress(text) {
   const t = String(text || "").toLowerCase().trim();
@@ -23,12 +23,14 @@ async function quoteDeliveryIfPossible(addressText) {
 
     const within = q?.is_serviceable === true && km <= MAX_KM;
 
+    const fee = q?.delivery_fee ?? null;
+
     return {
       ok: true,
       within,
       km,
       etaMin: q?.eta_minutes ?? null,
-      fee: q?.delivery_fee ?? null,
+      fee,
       formatted: q?.formatted_address || addressText,
       lat: Number.isFinite(Number(q?.latitude)) ? Number(q.latitude) : null,
       lng: Number.isFinite(Number(q?.longitude)) ? Number(q.longitude) : null,
