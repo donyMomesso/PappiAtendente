@@ -874,9 +874,10 @@ function calcOrderAmount(payload) {
 // Helper - Construtor de Endereço Cardápio Web (seguro)
 // ===================================================
 function buildDeliveryAddressObjectFromCustomer(customer) {
-  const cep = extractCep(customer?.lastAddress || "") || null;
+  const cep = extractCep(customer?.lastAddress || "") || extractCep(customer?.lastStreet || "") || null;
   const lat = Number(customer?.lastLat);
   const lng = Number(customer?.lastLng);
+  const hasCoords = Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) > 0.0001 && Math.abs(lng) > 0.0001;
 
   return {
     state: "SP",
@@ -887,72 +888,10 @@ function buildDeliveryAddressObjectFromCustomer(customer) {
     complement: customer?.lastComplement || null,
     reference: null,
     postal_code: cep || null,
-    latitude: Number.isFinite(lat) && Math.abs(lat) > 0.0001 ? String(lat) : null,
-    longitude: Number.isFinite(lng) && Math.abs(lng) > 0.0001 ? String(lng) : null,
+    coordinates: hasCoords ? { latitude: lat, longitude: lng } : null,
   };
 }
 
-// Converte payload interno → formato PrefilledOrder do CardápioWeb
-// A API espera: cart (não items), option_groups (não options flat), IDs inteiros, kind
-function buildPrefilledOrder(payload, catalogRaw) {
-  // Mapa option_id -> option_group_id do catálogo
-  const optGroupMap = new Map();
-  // Mapa item_id -> kind do catálogo
-  const itemKindMap = new Map();
-  if (catalogRaw?.categories) {
-    for (const cat of catalogRaw.categories) {
-      for (const it of (cat.items || [])) {
-        itemKindMap.set(Number(it.id), it.kind || "regular_item");
-        for (const og of (it.option_groups || [])) {
-          for (const opt of (og.options || [])) {
-            optGroupMap.set(Number(opt.id), Number(og.id));
-          }
-        }
-      }
-    }
-  }
-
-  const cart = (payload.items || []).map(it => {
-    const itemId = Number(it.item_id);
-    const cartItem = {
-      item_id: itemId,
-      quantity: Number(it.quantity) || 1,
-      kind: itemKindMap.get(itemId) || it.kind || "regular_item",
-      observation: it.observation || null,
-    };
-
-    const opts = it.options || [];
-    if (opts.length > 0) {
-      const groupsMap = new Map();
-      for (const opt of opts) {
-        const optId = Number(opt.option_id);
-        const gId = optGroupMap.get(optId);
-        if (!gId) {
-          console.warn(`⚠️ buildPrefilledOrder: option_id ${optId} sem group no catálogo`);
-          continue;
-        }
-        if (!groupsMap.has(gId)) groupsMap.set(gId, []);
-        groupsMap.get(gId).push({ option_id: optId, quantity: Number(opt.quantity) || 1 });
-      }
-      if (groupsMap.size > 0) {
-        cartItem.option_groups = Array.from(groupsMap.entries()).map(([gid, os]) => ({
-          option_group_id: gid,
-          options: os,
-        }));
-      }
-    }
-
-    return cartItem;
-  });
-
-  const out = {
-    order_type: payload.order_type,
-    customer: payload.customer,
-    cart,
-  };
-  if (payload.delivery_address) out.delivery_address = payload.delivery_address;
-  return out;
-}
 
 function hasValidDeliveryAddressForCW(customer) {
   const cep = extractCep(customer?.lastAddress || "");
@@ -1144,8 +1083,7 @@ router.post("/webhook/inter", async (req, res) => {
               parsedData.payments[0].total = parsedData.totals.order_amount;
             }
 
-            if (!menuCache.raw) await getMenu();
-            const cwResp = await createOrder(buildPrefilledOrder(parsedData, menuCache.raw));
+            const cwResp = await createOrder(parsedData);
 
             await prisma.order.update({
               where: { id: order.id },
@@ -1973,7 +1911,7 @@ ${historyText}
 
       // Dinheiro ou cartão: cria pedido direto
       try {
-        const cwResp = await createOrder(buildPrefilledOrder(finalOrderPayload, menuCache.raw));
+        const cwResp = await createOrder(finalOrderPayload);
 
         const summaryCard = buildOrderSummary(finalOrderPayload.items);
         await Promise.all([
