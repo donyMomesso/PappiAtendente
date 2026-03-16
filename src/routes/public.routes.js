@@ -399,12 +399,8 @@ async function sendRapport(to, customer) {
   ];
 
   if (visits === 0) {
-    // Se tem histórico no CW (pediu pelo app/site antes), trata como cliente conhecido
-    const cwHint = cwLastItemName
-      ? `\n\nVi que você já conhece a Pappi! 😄 Da última vez foi *${cwLastItemName}* — boa escolha!${pointsHint}`
-      : "";
     await sendButtons(to,
-      `Olá${name ? `, ${name}` : ""}! 👋 Bem-vindo(a) à *Pappi Pizza* 🍕${cwHint}\n\n` +
+      `Olá${name ? `, ${name}` : ""}! 👋 Bem-vindo(a) à *Pappi Pizza* 🍕\n\n` +
       `Cardápio online: ${LINK_CARDAPIO}\n` +
       `⏱️ Entrega ${ETA_DELIVERY} | Retirada ${ETA_TAKEOUT}\n\n` +
       `É *Entrega* ou *Retirada*?`,
