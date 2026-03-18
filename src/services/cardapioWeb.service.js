@@ -227,40 +227,36 @@ async function getDeliveryFee({ lat, lng, address } = {}) {
  * Cancela um pedido no CW pelo ID do pedido (cwOrderId).
  * Tenta PATCH /orders/{id}/cancel primeiro; se falhar, tenta PATCH /orders/{id} com status canceled.
  */
-async function cancelOrder(cwOrderId) {
+async function cancelOrder(cwOrderId, reason = "Cliente solicitou cancelamento") {
   const base = cwBase();
-  const headers = cwHeadersPartner();
-  const jsonHeaders = { ...headers, "Content-Type": "application/json" };
+  const apiKey = ENV.CARDAPIOWEB_API_KEY || ENV.CARDAPIOWEB_TOKEN;
+  if (!apiKey) throw new Error("CARDAPIOWEB_API_KEY não configurado.");
 
-  const attempts = [
-    // 1: PATCH /orders/{id}/cancel (sem body)
-    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}/cancel`, { method: "PATCH", headers }, 10000),
-    // 2: POST /orders/{id}/cancel
-    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}/cancel`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({}) }, 10000),
-    // 3: POST /orders/{id}/events com status CANCELLED
-    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}/events`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ status: "CANCELLED" }) }, 10000),
-    // 4: POST /orders/{id}/events com action cancel
-    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}/events`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ action: "cancel" }) }, 10000),
-    // 5: PATCH /orders/{id} com status lowercase
-    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}`, { method: "PATCH", headers: jsonHeaders, body: JSON.stringify({ status: "canceled" }) }, 10000),
-    // 6: PATCH /orders/{id} com status uppercase (padrão CW)
-    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}`, { method: "PATCH", headers: jsonHeaders, body: JSON.stringify({ status: "CANCELLED" }) }, 10000),
-    // 7: PUT /orders/{id}
-    () => fetchWithTimeout(`${base}/api/partner/v1/orders/${cwOrderId}`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify({ status: "CANCELLED" }) }, 10000),
-  ];
+  // Endpoint correto: POST /cancel com X-API-KEY only + cancellation_reason (retorna 204)
+  const url = `${base}/api/partner/v1/orders/${cwOrderId}/cancel`;
+  const resp = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "X-API-KEY": apiKey,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ cancellation_reason: reason }),
+    },
+    10000
+  );
 
-  for (const attempt of attempts) {
-    try {
-      const resp = await attempt();
-      const data = await safeJson(resp);
-      console.log(`CW cancelOrder ${cwOrderId} → ${resp.status}`, JSON.stringify(data));
-      if (resp.ok) return { ok: true, data };
-    } catch (e) {
-      console.warn("CW cancelOrder attempt failed:", e.message);
-    }
+  // 204 = sucesso (sem body)
+  if (resp.status === 204 || resp.ok) {
+    console.log(`CW cancelOrder ${cwOrderId} → ${resp.status} OK`);
+    return { ok: true };
   }
 
-  return { ok: false, error: "Todos os endpoints de cancelamento falharam" };
+  const data = await safeJson(resp);
+  console.error(`CW cancelOrder ${cwOrderId} → ${resp.status}`, JSON.stringify(data));
+  return { ok: false, error: `HTTP ${resp.status}`, data };
 }
 
 module.exports = {

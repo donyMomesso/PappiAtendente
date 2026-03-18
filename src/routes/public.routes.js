@@ -31,6 +31,8 @@ const ETA_TAKEOUT = "30 a 40 min";
 // ===================================================
 let merchantCache = { open: null, hoursText: null, checkedAt: 0 };
 
+const DAY_KEYS = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+
 async function isStoreOpen() {
   const now = Date.now();
   if (merchantCache.open !== null && now - merchantCache.checkedAt < 2 * 60 * 1000) {
@@ -38,20 +40,40 @@ async function isStoreOpen() {
   }
   try {
     const merchant = await getMerchant();
-    const open = merchant?.status === "OPEN";
-    // Tenta montar um texto amigável do horário de hoje
+
+    // Loja inativa no CW (INACTIVE, BLOCKED, etc.) — só ACTIVE está operacional
+    if (merchant?.status && merchant.status !== "ACTIVE") {
+      merchantCache = { open: false, hoursText: null, checkedAt: now };
+      return false;
+    }
+
+    const oh = merchant?.opening_hours;
+    let open = true;
     let hoursText = null;
-    if (merchant?.opening_hours) {
-      const today = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo", weekday: "long" }).split(",")[0].toLowerCase();
-      const todayEntry = merchant.opening_hours.find(h =>
-        String(h.day_of_week || h.day || "").toLowerCase().includes(today.slice(0, 3))
-      );
-      if (todayEntry?.opens || todayEntry?.start) {
-        const opens = todayEntry.opens || todayEntry.start;
-        const closes = todayEntry.closes || todayEntry.end;
-        hoursText = closes ? `${opens} às ${closes}` : `a partir das ${opens}`;
+
+    if (oh) {
+      // temporary_state "closed" só vale se o prazo ainda não expirou
+      const tmpEnd = oh.temporary_state_end_at ? new Date(oh.temporary_state_end_at) : null;
+      if (oh.temporary_state === "closed" && tmpEnd && tmpEnd > new Date()) {
+        merchantCache = { open: false, hoursText: null, checkedAt: now };
+        return false;
+      }
+
+      // Verifica o horário de hoje (fuso São Paulo)
+      const spNow = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
+      const dayKey = DAY_KEYS[spNow.getDay()];
+      const intervals = oh[dayKey]; // ex: [["18:00","22:00"]]
+
+      if (Array.isArray(intervals) && intervals.length > 0) {
+        const hhmm = n => { const [h,m] = String(n).split(":"); return Number(h)*60+Number(m); };
+        const cur = spNow.getHours()*60 + spNow.getMinutes();
+        open = intervals.some(([s, e]) => cur >= hhmm(s) && cur < hhmm(e));
+        // Texto amigável: primeiro intervalo do dia
+        const [s, e] = intervals[0];
+        hoursText = `${s} às ${e}`;
       }
     }
+
     merchantCache = { open, hoursText, checkedAt: now };
     return open;
   } catch {
@@ -1064,12 +1086,11 @@ router.get("/debug/menu", async (req, res) => {
 // ===================================================
 const CW_STATUS_MSG = {
   waiting_confirmation: "⏳ Pedido recebido! Aguardando confirmação da loja...",
-  confirmed:            "✅ Pedido confirmado pela loja! Logo entra em preparo 🍕",
-  in_production:        "👨‍🍳 Seu pedido entrou em produção! Estamos fazendo com carinho.",
-  ready:                "🔔 Seu pedido está pronto!",
-  released:             "🛵 Seu pedido saiu para entrega! Em breve estará aí.",
+  confirmed:            "✅ Pedido confirmado! Já estamos preparando com carinho 🍕",
+  scheduled_confirmed:  "✅ Pedido agendado e confirmado! Avisaremos quando entrar em preparo.",
   waiting_to_catch:     "🔔 Pedido pronto para retirada! Pode vir buscar 😊",
-  delivered:            "🎉 Pedido entregue! Bom apetite 😋",
+  released:             "🛵 Seu pedido saiu para entrega! Em breve estará aí.",
+  closed:               "🎉 Pedido entregue! Bom apetite 😋",
   canceled:             "❌ Seu pedido foi cancelado. Qualquer dúvida é só chamar.",
 };
 
@@ -1101,9 +1122,9 @@ router.post("/cardapioweb/webhook", async (req, res) => {
       include: { customer: true },
     }).catch(() => null);
 
-    // Fallback 1: CW incluiu customer.phone no payload
+    // Fallback 1: CW incluiu customer.phone no payload do webhook
     // Fallback 2: busca o pedido completo na API do CW para obter o telefone
-    let rawPhone = dbOrder?.customer?.phone || order?.customer?.phone;
+    let rawPhone = dbOrder?.customer?.phone || body?.customer?.phone || body?.data?.customer?.phone;
     if (!rawPhone) {
       const cwOrder = await getCwOrderById(cwId).catch(() => null);
       rawPhone = cwOrder?.customer?.phone || null;
@@ -1414,7 +1435,7 @@ router.post("/webhook", async (req, res) => {
         }
         // Cria o pedido com observacao indicando que e acrescimo
         const activeOrder = await prisma.order.findFirst({
-          where: { customerId: customer.id, status: { in: ["waiting_confirmation", "confirmed", "in_production"] } },
+          where: { customerId: customer.id, status: { in: ["waiting_confirmation", "confirmed"] } },
           orderBy: { createdAt: "desc" }
         }).catch(() => null);
         const obsPrefix = activeOrder ? `ACRESCENTAR AO PEDIDO #${activeOrder.displayId} - ` : "ACRESCIMO - ";
@@ -2017,7 +2038,7 @@ Formato:
       "name": "NOME DO ITEM",
       "quantity": 1,
       "unit_price": 0,
-      "observation": "obs do item se houver",
+      "observation": "obs específica do item (ex: sem cebola, bem passado). NAO coloque 'meio a meio' ou 'metade X metade Y' pois os sabores já estão nas options.",
       "options": [
         {
           "option_id": "ID_DA_OPCAO",
@@ -2228,7 +2249,7 @@ ${historyText}
 
       // Verifica se ja tem pedido ativo — evita duplicacao na cozinha
       const activeOrder = await prisma.order.findFirst({
-        where: { customerId: customer.id, status: { in: ["waiting_confirmation", "confirmed", "in_production"] } },
+        where: { customerId: customer.id, status: { in: ["waiting_confirmation", "confirmed"] } },
         orderBy: { createdAt: "desc" }
       }).catch(() => null);
 
